@@ -1,11 +1,15 @@
 ﻿
-name: Sync project-a to project-b
+name: Sync selected files from project-a to project-b
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+    inputs:
+      files:
+        description: >-
+          Comma-separated file paths to sync, e.g.
+          README.md,app.py,src/utils.py
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,24 +30,136 @@ jobs:
           token: ${{ secrets.PROJECT_B_TOKEN }}
           path: destination
 
-      - name: Sync files
+      - name: Validate and copy selected files
+        id: copy
+        env:
+          FILES_TO_SYNC: ${{ inputs.files }}
         run: |
-          rsync -av --delete \
-            --exclude='.git' \
-            --exclude='.github' \
-            ./ destination/
+          set -euo pipefail
 
-      - name: Commit and push changes
+          python3 <<'PY'
+          import os
+          import shutil
+          import uuid
+          from pathlib import Path, PurePosixPath
+
+          source_root = Path.cwd()
+          destination_root = source_root / "destination"
+
+          raw = os.environ["FILES_TO_SYNC"]
+          requested = raw.split(",")
+
+          if not raw.strip():
+              raise SystemExit("ERROR: Enter at least one file path.")
+
+          selected = []
+          seen = set()
+
+          for item in requested:
+              name = item.strip()
+
+              if not name:
+                  raise SystemExit(
+                      "ERROR: Empty file path detected. "
+                      "Separate paths with commas."
+                  )
+
+              if "\n" in name or "\r" in name or "\\" in name:
+                  raise SystemExit(
+                      f"ERROR: Invalid path format: {name!r}"
+                  )
+
+              path = PurePosixPath(name)
+
+              if path.is_absolute() or ".." in path.parts:
+                  raise SystemExit(
+                      f"ERROR: Absolute paths and '..' are forbidden: {name}"
+                  )
+
+              if any(
+                  part.lower() in {".git", ".github"}
+                  for part in path.parts
+              ):
+                  raise SystemExit(
+                      f"ERROR: Git metadata and .github paths "
+                      f"cannot be synced: {name}"
+                  )
+
+              if name in seen:
+                  continue
+
+              seen.add(name)
+              source = source_root.joinpath(*path.parts)
+              destination = destination_root.joinpath(*path.parts)
+
+              # Reject symlinks in every source path component.
+              current = source_root
+              for part in path.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(
+                          f"ERROR: Symlinks are not allowed: {name}"
+                      )
+
+              if not source.is_file():
+                  raise SystemExit(
+                      f"ERROR: Source file does not exist: {name}"
+                  )
+
+              # Prevent writing through existing destination symlinks.
+              current = destination_root
+              for part in path.parts:
+                  current = current / part
+                  if current.is_symlink():
+                      raise SystemExit(
+                          f"ERROR: Destination contains a symlink: {name}"
+                      )
+
+              selected.append(name)
+
+          if not selected:
+              raise SystemExit("ERROR: No valid files selected.")
+
+          for name in selected:
+              path = PurePosixPath(name)
+              source = source_root.joinpath(*path.parts)
+              destination = destination_root.joinpath(*path.parts)
+
+              destination.parent.mkdir(
+                  parents=True, exist_ok=True
+              )
+              shutil.copy2(source, destination)
+              print(f"Copied: {name}")
+
+          # Safely pass the selected paths to the commit step.
+          delimiter = "FILES_" + uuid.uuid4().hex
+          with open(
+              os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8"
+          ) as output:
+              output.write(f"files<<{delimiter}\n")
+              output.write("\n".join(selected) + "\n")
+              output.write(f"{delimiter}\n")
+
+          print(f"Validated {len(selected)} file(s).")
+          PY
+
+      - name: Commit and push selected files
         working-directory: destination
+        env:
+          SELECTED_FILES: ${{ steps.copy.outputs.files }}
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A
+          mapfile -t files <<< "$SELECTED_FILES"
+
+          git add -- "${files[@]}"
 
           if ! git diff --cached --quiet; then
-            git commit -m "Sync from project-a"
+            git commit -m "Sync selected files from project-a"
             git push origin main
           else
             echo "No changes to sync."
